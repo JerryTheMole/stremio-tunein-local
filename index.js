@@ -1,4 +1,9 @@
-const modules = require('./modules')
+const { addonBuilder, getInterface, getRouter } = require('stremio-addon-sdk')
+const { proxy } = require('internal')
+const ent = require('ent')
+const namedQueue = require('named-queue')
+const needle = require('needle')
+const async = require('async')
 
 const defaults = {
 	name: 'TuneIn',
@@ -30,7 +35,7 @@ function tuneinMetaObj(el, url) {
     return {
         backgroundShape: 'contain',
         id: defaults.prefix + el.id,
-        name: modules.get.ent.decode(el.title || ' '),
+        name: ent.decode(el.title || ' '),
         poster: el.thumb || '',
         logo: el.thumb || '',
         posterShape: 'square',
@@ -57,101 +62,39 @@ function normalizeResults(res) {
     })
 }
 
-function phantomLoad(opts, cb) {
-	var phInstance
-
-	modules.get.phantom.create(["--ignore-ssl-errors=true", "--web-security=false", "--ssl-protocol=tlsv1", "--load-images=false", "--disk-cache=true"], { logLevel: 'warn' })
-//		phantom.create(["--ignore-ssl-errors=true", "--web-security=false", "--ssl-protocol=tlsv1"], { logLevel: opts.log || 'warn' })
-
-	.then(function(instance) {
-		phInstance = instance
-		return instance.createPage()
-	})
-	.then(function(page) {
-
-// this breaks phantomjs responses for some reason:
-
-//			if (!opts.timeout)
-//				opts.timeout = 15000 // default timeout of 15 secs
-
-//			page.property('settings', { resourceTimeout: opts.timeout })
-
-		if (opts.clearMemory)
-			page.invokeMethod('clearMemoryCache')
-
-		if (opts.referer)
-			page.property('customHeaders', { 'Referer': opts.referer })
-
-		if (opts.agent)
-			page.setting('userAgent', opts.agent)
-
-		if (opts.noRedirect)
-			page.property('navigationLocked', true)
-
-//			page.on('onResourceTimeout', function() {
-//				log('Page Timed Out')
-//			})
-
-		cb(phInstance, page)
-
-	})
-}
-
-function phantomClose(instance, page, cb) {
-
-	setTimeout(function() {
-
-		var end = function() {
-			var next = cb = function() {}
-			instance.exit().then(cb || next, cb || next)
-		}
-
-		page.close().then(end, end)
-
-	})
-
-}
-
-let sessionQueue
-
-function setNamedQueue() {
-	if (!sessionQueue) {
-		sessionQueue = new modules.get['named-queue']((task, cb) => {
-			getSessionId(gotSessionId, cb)
-		}, 1)
-	}
-	return true
-}
+let sessionQueue = new namedQueue((task, cb) => {
+	getSessionId(gotSessionId, cb)
+}, 1)
 
 function getSessionId(cb, endCb) {
 	if (sessionID) {
 		endCb(true)
 		return
 	}
-    phantomLoad({
+	const phantom = require('phantom')
+
+    phantom.load({
         clearMemory: true,
         agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36',
-    }, function(phInstance, page) {
+    }, null, null, function(phInstance, page) {
 
         let tuneInSessionId
 
 		page.on('onResourceRequested', function(req, netReq) {
 			if (!tuneInSessionId && req.url.includes('https://opml.radiotime.com/')) {
 				var matches = req.url.match(/&serial=[a-z0-9-]+/gm)
-				if (matches.length) {
+				if (matches.length)
 					tuneInSessionId = matches[0].split('=')[1]
-					console.log(tuneInSessionId)
-				}
 			}
 		})
 
         page.open('https://www.tunein.com/').then(async (status, body) => {
             cb(tuneInSessionId, endCb)
-            phantomClose(phInstance, page, () => {})
+            phantom.close(phInstance, page, () => {})
         }, function(err) {
         	console.log(err)
             cb(false, endCb)
-            phantomClose(phInstance, page, () => {})
+            phantom.close(phInstance, page, () => {})
         })
     })
 
@@ -177,131 +120,126 @@ function gotSessionId(sessionId, endCb) {
     endCb(true)
 }
 
-module.exports = {
-	manifest: local => {
-		modules.set(local.modules)
-		setNamedQueue()
-		sessionQueue.push({ id: 'session' }, () => {})
-		return Promise.resolve({
-			id: 'org.' + defaults.name.toLowerCase().replace(/[^a-z]+/g,''),
-			version: '1.0.0',
-			name: defaults.name,
-			description: 'Radios from TuneIn',
-			resources: ['stream', 'meta', 'catalog'],
-			types: ['tv'],
-			idPrefixes: [defaults.prefix],
-			icon: defaults.icon,
-			catalogs: [
-				{
-					id: defaults.prefix + 'cat',
-					name: 'TuneIn',
-					type: 'tv',
-					extra: [{ name: 'search' }, { name: 'skip' }]
-				}
-			]
-		})
-	},
-	handler: (args, local) => {
-		modules.set(local.modules)
-		setNamedQueue()
-		return new Promise((resolve, reject) => {
-
-			sessionQueue.push({ id: 'session' }, success => {
-				if (!success)
-					reject(defaults.name + ' - Could not extract API token to handle request')
-				else {
-					const persist = local.persist
-					const config = local.config
-					const proxy = modules.get.internal.proxy
-					const extra = args.extra || {}
-					const skip = parseInt(extra.skip || 0)
-
-				    if (!args.id) {
-				        reject(new Error(defaults.name + ' - No ID Specified'))
-				        return
-				    }
-
-					if (args.resource == 'catalog') {
-				        if (extra.search) {
-				        	const reqUrl = url.search(extra.search, 0, 75)
-					        modules.get.needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, resp, res) {
-					            if (res && res.Items && res.Items.length)
-					                resolve({ metas: normalizeResults(res.Items).map(function(el) { return tuneinMetaObj(el) }) })
-					            else reject(defaults.name + ' - No Response Body 2')
-					        })
-				        } else {
-				        	const reqUrl = url.catalog()
-				            modules.get.needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, resp, res) {
-				                if (res && res.Items && res.Items[0] && res.Items[0].Children && res.Items[0].Children.length)
-				                   	resolve({ metas: normalizeResults(res.Items[0].Children).map(function(el) { return tuneinMetaObj(el) }).slice(skip, skip + defaults.paginate) })
-				                else reject(defaults.name + ' - No Response Body 1')
-				            })
-				        }
-					} else if (args.resource == 'meta') {
-				        args.id = args.id.replace(defaults.prefix, '')
-				        var parts = args.id.split('---')
-				        const reqUrl = url.meta(parts[0], parts[1])
-				        modules.get.needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, r, resp) {
-				           if (resp && resp.Items && resp.Items.length) {
-				            var item
-				            resp.Items.some(function(el) {
-				                if (el && el.Title == 'Stations') {
-				                    if (el.Children && el.Children[0]) {
-				                        item = el.Children[0]
-				                    }
-				                }
-				            }) 
-				            if (item) {
-				                var parsedMeta = tuneinMetaObj(normalizeResults([item])[0])
-				                parsedMeta.id = defaults.prefix + args.id
-				                resolve({ meta: parsedMeta })
-				            } else
-				                reject(defaults.name + ' - No Meta Found 2')
-				          } else reject(defaults.name + ' - No Meta Found 1')
-				        })
-					} else if (args.resource == 'stream') {
-						const parts = args.id.replace(defaults.prefix, '').split('---')
-						const reqUrl = url.stream(parts[0], parts[1])
-				        modules.get.needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, r, resp) {
-				            if (((resp || {}).body || []).length) {
-				            	const streams = []
-				            	const q = modules.get.async.queue((task, cb) => {
-				            		if (task.url.startsWith('https://stream.radiotime.com/'))
-					            		modules.get.needle.get(task.url, { headers: defaults.headers, read_timeout: 5000 }, (err, resp, body) => {
-					            			if (!err && ((body || {})['Streams'] || []).length) {
-					            				body['Streams'].forEach(el => {
-					            					streams.push({
-					            						url: el.Url,
-					            						title: el.Bandwidth ? ('Bitrate: '+el.Bandwidth) : '',
-					            						tag: [(el.MediaType || 'mp3')]
-					            					})
-					            				})
-					            			}
-				            				streams.push(task)
-					            			cb()
-					            		})
-					            	else {
-			            				streams.push(task)
-				            			cb()
-					            	}
-				            	})
-				            	q.drain = () => {
-				            		if (streams.length)
-				            			resolve({ streams })
-				            		else reject(defaults.name + ' - No Streams Found 2')
-				            	}
-				                resp.body.forEach(function(el) {
-				                    q.push({
-				                      url: el.url,
-				                      title: el.bitrate ? ('Bitrate: '+el.bitrate) : '',
-				                      tag: [(el.media_type || 'mp3')]
-				                    })
-				                })
-				            } else reject(defaults.name + ' - No Streams Found 1')
-				        })
-					}
-				}
-			})
-		})
-	}
+function queueCb(success) {
+	if (!success)
+		console.log(defaults.name + ' - Could not extract Session ID, trying again in 5 seconds')
+	else
+		console.log(defaults.name + ' - Extracted session ID successfully')
 }
+
+sessionQueue.push({ id: 'session' }, queueCb)
+
+
+const builder = new addonBuilder({
+	id: 'org.' + defaults.name.toLowerCase().replace(/[^a-z]+/g,''),
+	version: '1.0.0',
+	name: defaults.name,
+	description: 'Radios from TuneIn',
+	resources: ['stream', 'meta', 'catalog'],
+	types: ['tv'],
+	idPrefixes: [defaults.prefix],
+	icon: defaults.icon,
+	catalogs: [
+		{
+			id: defaults.prefix + 'cat',
+			name: 'TuneIn',
+			type: 'tv',
+			extra: [{ name: 'search' }, { name: 'skip' }]
+		}
+	]
+})
+
+builder.defineStreamHandler(args => {
+	return new Promise((resolve, reject) => {
+		const parts = args.id.replace(defaults.prefix, '').split('---')
+		const reqUrl = url.stream(parts[0], parts[1])
+	    needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, r, resp) {
+	        if (((resp || {}).body || []).length) {
+	        	const streams = []
+	        	const q = async.queue((task, cb) => {
+	        		if (task.url.startsWith('https://stream.radiotime.com/'))
+	            		needle.get(task.url, { headers: defaults.headers, read_timeout: 5000 }, (err, resp, body) => {
+	            			if (!err && ((body || {})['Streams'] || []).length) {
+	            				body['Streams'].forEach(el => {
+	            					streams.push({
+	            						url: el.Url,
+	            						title: el.Bandwidth ? ('Bitrate: '+el.Bandwidth) : '',
+	            						tag: [(el.MediaType || 'mp3')]
+	            					})
+	            				})
+	            			}
+	        				streams.push(task)
+	            			cb()
+	            		})
+	            	else {
+	    				streams.push(task)
+	        			cb()
+	            	}
+	        	})
+	        	q.drain = () => {
+	        		if (streams.length)
+	        			resolve({ streams })
+	        		else reject(defaults.name + ' - No Streams Found 2')
+	        	}
+	            resp.body.forEach(function(el) {
+	                q.push({
+	                  url: el.url,
+	                  title: el.bitrate ? ('Bitrate: '+el.bitrate) : '',
+	                  tag: [(el.media_type || 'mp3')]
+	                })
+	            })
+	        } else reject(defaults.name + ' - No Streams Found 1')
+	    })
+	})
+})
+
+builder.defineMetaHandler(args => {
+	return new Promise((resolve, reject) => {
+	    args.id = args.id.replace(defaults.prefix, '')
+	    var parts = args.id.split('---')
+	    const reqUrl = url.meta(parts[0], parts[1])
+	    needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, r, resp) {
+	       if (resp && resp.Items && resp.Items.length) {
+	            let item
+	            resp.Items.some(function(el) {
+	                if (el && el.Title == 'Stations') {
+	                    if (el.Children && el.Children[0])
+	                        item = el.Children[0]
+	                }
+	            }) 
+	            if (item) {
+	                const parsedMeta = tuneinMetaObj(normalizeResults([item])[0])
+	                parsedMeta.id = defaults.prefix + args.id
+	                resolve({ meta: parsedMeta })
+	            } else
+	                reject(defaults.name + ' - No Meta Found 2')
+	        } else reject(defaults.name + ' - No Meta Found 1')
+	    })
+	})
+})
+
+builder.defineCatalogHandler(args => {
+	return new Promise((resolve, reject) => {
+		const extra = args.extra || {}
+		const skip = parseInt(extra.skip || 0)
+	    if (extra.search) {
+	    	const reqUrl = url.search(extra.search, 0, 75)
+	        needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, resp, res) {
+	            if (res && res.Items && res.Items.length)
+	                resolve({ metas: normalizeResults(res.Items).map(function(el) { return tuneinMetaObj(el) }) })
+	            else reject(defaults.name + ' - No Response Body 2')
+	        })
+	    } else {
+	    	const reqUrl = url.catalog()
+	        needle.get(reqUrl, { headers: { referer: reqUrl, origin: defaults.host } }, function(err, resp, res) {
+	            if (res && res.Items && res.Items[0] && res.Items[0].Children && res.Items[0].Children.length)
+	               	resolve({ metas: normalizeResults(res.Items[0].Children).map(function(el) { return tuneinMetaObj(el) }).slice(skip, skip + defaults.paginate) })
+	            else reject(defaults.name + ' - No Response Body 1')
+	        })
+	    }
+	})
+})
+
+const addonInterface = getInterface(builder)
+
+module.exports = getRouter(addonInterface)
