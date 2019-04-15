@@ -136,14 +136,14 @@ const builder = new addonBuilder({
 	name: defaults.name,
 	description: 'Radios from TuneIn',
 	resources: ['stream', 'meta', 'catalog'],
-	types: ['tv'],
+	types: ['music', 'tv'],
 	idPrefixes: [defaults.prefix],
 	icon: defaults.icon,
 	catalogs: [
 		{
 			id: defaults.prefix + 'cat',
 			name: 'TuneIn',
-			type: 'tv',
+			type: 'music',
 			extra: [{ name: 'search' }, { name: 'skip' }]
 		}
 	]
